@@ -112,12 +112,32 @@ class EventViewSet(viewsets.ModelViewSet):
         """
         event = self.get_object()
 
-        # Проверка наличия существующей регистрации перед сериализацией
-        if EventRegistration.objects.filter(event=event, user=request.user).exists():
-            return Response(
-                {"error": "Вы уже зарегистрированы на это мероприятие"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        # Проверка существующей регистрации
+        existing_registration = EventRegistration.objects.filter(event=event, user=request.user).first()
+        
+        if existing_registration:
+            # Если регистрация отменена или отклонена, обновляем её статус
+            if existing_registration.status in ['CANCELLED_BY_USER', 'REJECTED_BY_ORGANIZER']:
+                # Обновляем статус существующей регистрации
+                existing_registration.status = 'PENDING_APPROVAL'
+                # Обновляем заметки пользователя, если они предоставлены
+                if 'notes_by_user' in request.data:
+                    existing_registration.notes_by_user = request.data['notes_by_user']
+                existing_registration.registration_datetime = timezone.now()
+                existing_registration.save()
+                
+                # Увеличиваем счетчик участников
+                event.current_participants_count += 1
+                event.save()
+                
+                serializer = EventRegistrationSerializer(existing_registration)
+                return Response(serializer.data, status=status.HTTP_200_OK)
+            else:
+                # Если регистрация активна, возвращаем ошибку
+                return Response(
+                    {"error": "Вы уже зарегистрированы на это мероприятие"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
         # Проверка статуса мероприятия до валидации
         if event.status not in ['PLANNED', 'REGISTRATION_OPEN']:
@@ -235,49 +255,62 @@ class EventRegistrationViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """
-        Пользователи видят только свои регистрации
+        Пользователи видят только свои регистрации или регистрации на свои мероприятия
         """
-        if self.request.user.is_authenticated:
-            return EventRegistration.objects.filter(user=self.request.user)
-        return EventRegistration.objects.none()
+        if not self.request.user.is_authenticated:
+            return EventRegistration.objects.none()
+        
+        # Получаем ID мероприятий, где пользователь является организатором
+        organized_event_ids = Event.objects.filter(organizer=self.request.user).values_list('id', flat=True)
+        
+        # Возвращаем регистрации пользователя или регистрации на его мероприятия
+        return EventRegistration.objects.filter(
+            Q(user=self.request.user) | Q(event__id__in=organized_event_ids)
+        )
 
     @action(detail=True, methods=['put'], url_path='status')
     def update_status(self, request, pk=None):
         """
         Обновление статуса регистрации (только для организатора).
         """
-        registration = self.get_object()
-        event = registration.event
+        try:
+            registration = self.get_object()
+            event = registration.event
 
-        # Проверка, что текущий пользователь - организатор
-        if event.organizer != request.user:
-            return Response(
-                {"error": "Только организатор может изменять статус регистрации"},
-                status=status.HTTP_403_FORBIDDEN
-            )
+            # Проверка, что текущий пользователь - организатор
+            if event.organizer != request.user:
+                return Response(
+                    {"error": "Только организатор может изменять статус регистрации"},
+                    status=status.HTTP_403_FORBIDDEN
+                )
 
-        new_status = request.data.get('status')
-        if not new_status or new_status not in [s[0] for s in EventRegistration.STATUS_CHOICES]:
+            new_status = request.data.get('status')
+            if not new_status or new_status not in [s[0] for s in EventRegistration.STATUS_CHOICES]:
+                return Response(
+                    {"error": "Необходимо указать корректный статус"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # Если статус меняется с подтвержденного на отклоненный - уменьшаем счетчик
+            if registration.status == 'CONFIRMED' and new_status == 'REJECTED_BY_ORGANIZER':
+                event.current_participants_count = max(0, event.current_participants_count - 1)
+                event.save()
+
+            # Если статус меняется с неподтвержденного на подтвержденный - увеличиваем счетчик
+            elif registration.status != 'CONFIRMED' and new_status == 'CONFIRMED':
+                event.current_participants_count += 1
+                event.save()
+
+            registration.status = new_status
+            registration.save()
+
+            serializer = EventRegistrationSerializer(registration)
+            return Response(serializer.data)
+        except Exception as e:
             return Response(
-                {"error": "Необходимо указать корректный статус"},
+                {"error": f"Ошибка при обновлении статуса: {str(e)}"},
                 status=status.HTTP_400_BAD_REQUEST
             )
-
-        # Если статус меняется с подтвержденного на отклоненный - уменьшаем счетчик
-        if registration.status == 'CONFIRMED' and new_status == 'REJECTED_BY_ORGANIZER':
-            event.current_participants_count = max(0, event.current_participants_count - 1)
-            event.save()
-
-        # Если статус меняется с неподтвержденного на подтвержденный - увеличиваем счетчик
-        elif registration.status != 'CONFIRMED' and new_status == 'CONFIRMED':
-            event.current_participants_count += 1
-            event.save()
-
-        registration.status = new_status
-        registration.save()
-
-        serializer = EventRegistrationSerializer(registration)
-        return Response(serializer.data)
 
 
 class EventResultViewSet(viewsets.ReadOnlyModelViewSet):

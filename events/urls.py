@@ -18,6 +18,9 @@ router.register(r'results', event_views.EventResultViewSet, basename='result')
 urlpatterns = [
     # Пользовательские маршруты
     path('users/me/', user_views.UserProfileView.as_view(), name='user-profile'),
+    
+    # Явный URL для обновления статуса регистрации
+    path('registrations/<int:pk>/status/', event_views.EventRegistrationViewSet.as_view({'put': 'update_status'}), name='registration-status-update'),
 
     # Включаем все маршруты из router
     path('', include(router.urls)),
